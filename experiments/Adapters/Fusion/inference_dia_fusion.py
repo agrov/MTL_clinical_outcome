@@ -1,0 +1,414 @@
+
+""" Infer Fusion model for Diagnosis"""
+
+
+import logging
+import os
+import random
+import sys
+from dataclasses import dataclass, field
+from typing import Optional
+from argparse import Namespace, ArgumentParser
+import numpy as np
+from datasets import load_dataset, load_metric
+from transformers.integrations import MLflowCallback
+from sklearn.metrics import roc_auc_score
+import transformers
+import torch
+import argparse
+from transformers import (
+    AdapterConfig,
+    AdapterType,
+    AutoConfig,
+    AutoModelWithHeads,
+    AutoModelForSequenceClassification,
+    AutoTokenizer,
+    EvalPrediction,
+    HfArgumentParser,
+    MultiLingAdapterArguments,
+    PretrainedConfig,
+    # Trainer,
+    TrainingArguments,
+    default_data_collator,
+    set_seed,
+)
+from transformers.trainer_utils import is_main_process
+from numpy import exp
+import pandas as pd
+from transformers import TextClassificationPipeline
+
+task_to_keys = {
+    "dia": "text",
+    "pro": "text",
+    "los": "text",
+    "mp": "text"
+}
+
+logger = logging.getLogger(__name__)
+DEVICE = torch.device("cuda")
+
+
+@dataclass
+class DataTrainingArguments:
+    """
+    Arguments pertaining to what data we are going to input our model for training and eval.
+    Using `HfArgumentParser` we can turn this class
+    into argparse arguments to be able to specify them on
+    the command line.
+    """
+
+    task_name: Optional[str] = field(
+        metadata={"help": "The name of the task to train on: " + ", ".join(task_to_keys.keys())},
+    )
+    label_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of the file including all the labels [valid only for multilabel tasks]: " + ", ".join(
+                task_to_keys.keys())},
+    )
+    max_seq_length: int = field(
+        default=512,
+        metadata={
+            "help": "The maximum total input sequence length after tokenization. Sequences longer "
+                    "than this will be truncated, sequences shorter will be padded."
+        },
+    )
+    overwrite_cache: bool = field(
+        default=False, metadata={"help": "Overwrite the cached preprocessed datasets or not."}
+    )
+    pad_to_max_length: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to pad all samples to `max_seq_length`. "
+                    "If False, will pad the samples dynamically when batching to the maximum length in the batch."
+        },
+    )
+    train_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the training data."}
+    )
+    test_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the training data."}
+    )
+    validation_file: Optional[str] = field(
+        default=None, metadata={"help": "A csv or a json file containing the validation data."}
+    )
+
+    def __post_init__(self):
+        if self.task_name is not None:
+            self.task_name = self.task_name.lower()
+            if self.task_name not in task_to_keys.keys():
+                raise ValueError("Unknown task, you should pick one in " + ",".join(task_to_keys.keys()))
+        elif self.train_file is None or self.validation_file is None:
+            raise ValueError("Need either a GLUE task or a training/validation file.")
+        else:
+            extension = self.train_file.split(".")[-1]
+            assert extension in ["csv", "json"], "`train_file` should be a csv or a json file."
+            extension = self.validation_file.split(".")[-1]
+            assert extension in ["csv", "json"], "`validation_file` should be a csv or a json file."
+
+
+@dataclass
+class ModelArguments:
+    """
+    Arguments pertaining to which model/config/tokenizer we are going to fine-tune from.
+    """
+
+    model_name_or_path: str = field(
+        metadata={"help": "Path to pretrained model or model identifier from huggingface.co/models"}
+    )
+    config_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained config name or path if not the same as model_name"}
+    )
+    tokenizer_name: Optional[str] = field(
+        default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    )
+    cache_dir: Optional[str] = field(
+        default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
+    )
+    use_fast_tokenizer: bool = field(
+        default=True,
+        metadata={"help": "Whether to use one of the fast tokenizer (backed by the tokenizers library) or not."},
+    )
+
+
+def doc_classification(config_file,output_dir,inference_file):
+    # See all possible arguments in src/transformers/training_args.py
+    # or by passing the --help flag to this script.
+    # We now keep distinct sets of args, for a cleaner separation of concerns.
+
+    parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments, MultiLingAdapterArguments))
+    model_args, data_args, training_args, adapter_args = parser.parse_json_file(json_file=config_file)
+    batch_size = 20
+    training_args.evaluation_strategy = "steps"
+    training_args.learning_rate = 0.00018266
+    training_args.per_device_train_batch_size = batch_size
+    training_args.per_device_eval_batch_size = batch_size
+    training_args.num_train_epochs = 61.794
+    training_args.eval_steps = 500
+    training_args.weight_decay = 0.01
+    training_args.load_best_model_at_end = True
+    training_args.metric_for_best_model = "roc_auc"
+    training_args.run_name = "mp_with_head_0"
+    training_args.warmup_steps = 50000
+    training_args.gradient_accumulation_steps = 19
+    training_args.evaluate_during_training = True
+    training_args.do_eval = True
+    training_args.seed = 11
+    training_args.output_dir = output_dir
+    training_args.do_train = False
+
+    if data_args.task_name == 'dia' or data_args.task_name == 'pro':
+        task_type = 'multilabel'
+    elif data_args.task_name == 'mp':
+        task_type = 'binary'
+    else:
+        task_type = 'multiclass'
+
+    if (
+            os.path.exists(training_args.output_dir)
+            and os.listdir(training_args.output_dir)
+            and training_args.do_train
+            and not training_args.overwrite_output_dir
+    ):
+        raise ValueError(
+            f"Output directory ({training_args.output_dir}) already exists and is not empty. "
+            "Use --overwrite_output_dir to overcome."
+        )
+
+    # Setup logging
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s -   %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if is_main_process(training_args.local_rank) else logging.WARN,
+    )
+
+    # Log on each process the small summary:
+    logger.warning(
+        f"Process rank: {training_args.local_rank}, device: {training_args.device}, n_gpu: {training_args.n_gpu}"
+        + f"distributed training: {bool(training_args.local_rank != -1)}, 16-bits training: {training_args.fp16}"
+    )
+    # Set the verbosity to info of the Transformers logger (on main process only):
+    if is_main_process(training_args.local_rank):
+        transformers.utils.logging.set_verbosity_info()
+    logger.info(f"Training/evaluation parameters {training_args}")
+
+    # Set seed before initializing model.
+    set_seed(training_args.seed)
+    # get the label name
+    label_name = data_args.task_name + "_label"
+
+    if data_args.task_name is not None and data_args.train_file.endswith(".csv"):
+        # Loading a dataset from local csv files
+        datasets = load_dataset(
+            "csv", data_files={"train": data_args.train_file, "validation": data_args.validation_file,
+                               "test": data_args.test_file}
+        )
+        datasets = datasets.filter(lambda example: example[label_name] != "-1")
+        logger.info(print(datasets['train']))
+    else:
+        # Loading a dataset from local json files
+        datasets = load_dataset(
+            "json", data_files={"train": data_args.train_file, "validation": data_args.validation_file}
+        )
+    # See more about loading any type of standard or custom dataset at
+    # https://huggingface.co/docs/datasets/loading_datasets.html.
+
+    # Labels
+    if data_args.task_name is not None:
+        if task_type == 'multilabel':
+            with open(data_args.label_file) as code_file:
+                label_list = code_file.read().split(" ")
+                label_list.sort()
+                num_labels = len(label_list)
+        else:
+            label_list = datasets["train"].unique(label_name)
+            label_list.sort()  # Let's sort it for determinism
+            num_labels = len(label_list)
+
+    # Load pretrained model and tokenizer
+    #
+    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
+    # download model & vocab.
+    config = AutoConfig.from_pretrained(
+        model_args.config_name if model_args.config_name else model_args.model_name_or_path,
+        num_labels=num_labels,
+        finetuning_task=data_args.task_name,
+        cache_dir=model_args.cache_dir,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_args.model_name_or_path,
+        cache_dir=model_args.cache_dir,
+        use_fast=model_args.use_fast_tokenizer,
+    )
+    model = AutoModelWithHeads.from_pretrained(model_args.model_name_or_path,
+                                               from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                                               config=config,
+                                               cache_dir=model_args.cache_dir,
+                                               )
+
+    from transformers.adapter_config import PfeifferConfig
+
+    model.load_adapter(
+        '/data_dir/MTL/experiments/Adapters/los_log/_objective_2021-04-20_08-03-18/_objective_18743e2a_10_gradient_accumulation_steps=9.0,learning_rate=7.732e-05,warmup_steps=676.0_2021-04-23_04-18-16/checkpoint_5500/checkpoint-5500/18743e2a/',
+        "text_task", config=PfeifferConfig(), with_head=False
+    )
+    model.load_adapter(
+        "/data_dir/MTL/experiments/Adapters/mp_log/_inner_2021-06-02_17-44-33/_inner_c1e5bbea_4_gradient_accumulation_steps=19.0,learning_rate=1.7266e-05,warmup_steps=1373.0_2021-06-04_00-56-31/checkpoint_8000/checkpoint-8000/c1e5bbea/",
+        "text_task", config=PfeifferConfig(), with_head=False)
+
+    model.load_adapter(
+        "/data_dir/MTL/experiments/Adapters/pro_log/_objective_2021-04-19_20-12-36/_objective_937cb522_11_gradient_accumulation_steps=14.0,learning_rate=9.8913e-05,warmup_steps=770.0_2021-04-23_20-15-07/checkpoint_9500/checkpoint-9500/937cb522/",
+        "text_task", config=PfeifferConfig(), with_head=False)
+    model.load_adapter(
+        "/data_dir/MTL/experiments/Adapters/dia_log/_objective_2021-05-11_10-07-53/_objective_c0d5ee86_1_gradient_accumulation_steps=5.0,learning_rate=0.001,warmup_steps=80.0_2021-05-11_10-07-56/checkpoint_5500/checkpoint-5500/c0d5ee86/",
+        "text_task", config=PfeifferConfig(), with_head=False)
+    model.load_adapter_fusion(os.path.join(training_args.output_dir, "c1e5bbea,18743e2a,937cb522,c0d5ee86"))
+    model.load_head(training_args.output_dir)
+    adapter_setup = [
+        [
+            "c1e5bbea",
+            "18743e2a",
+            "937cb522",
+            "c0d5ee86"
+        ]
+    ]
+    model.set_active_adapters(adapter_setup[0])
+    # Padding strategy
+    if data_args.pad_to_max_length:
+        padding = "max_length"
+        max_length = data_args.max_seq_length
+    else:
+        # We will pad later, dynamically at batch creation, to the max sequence length in each batch
+        padding = False
+        max_length = None
+
+    # Some models have set the order of the labels to use, so let's make sure we do use it.
+    label_to_id = None
+
+    if data_args.task_name is not None:
+        label_to_id = {v: i for i, v in enumerate(label_list)}
+
+    def preprocess_function(examples):
+        # Tokenize the texts
+        args = (
+            (examples['text'],)
+        )
+        result = tokenizer(*args, padding=padding, max_length=max_length, truncation=True)
+
+        # Map labels to IDs (not necessary for GLUE tasks)
+
+        if label_name in examples:
+            if task_type == 'multilabel':
+                result["label"] = []
+                for e in examples[label_name]:
+                    label_ids = [0] * len(label_list)
+                    for l in e.split(","):
+                        if l != "":
+                            label_ids[label_list.index(l)] = 1
+                    result["label"].append(label_ids)
+
+            else:
+                result["label"] = [label_to_id[l] for l in examples[label_name]]
+        return result
+
+    datasets = datasets.map(preprocess_function, batched=True, load_from_cache_file=not data_args.overwrite_cache)
+
+    train_dataset = datasets["train"]
+    eval_dataset = datasets["validation"]
+    test_dataset = datasets["test"]
+
+    # Log a few random samples from the training set:
+    for index in random.sample(range(len(train_dataset)), 3):
+        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+
+    # Get the metric function
+
+    # metric = load_metric("roc_auc", data_args.task_name)
+
+    def softmax(vector):
+        e = exp(vector)
+        return e / e.sum()
+
+    def compute_metrics(p: EvalPrediction):
+        if task_type == 'multilabel':
+            dim_size = len(p.label_ids[0])
+            mask = np.ones((dim_size), dtype=bool)
+            for c in range(dim_size):
+                if (max(p.label_ids[:, c]) == 0):
+                    mask[c] = False
+            labels = p.label_ids[:, mask]
+            y_score = np.array(p.predictions)[:, mask]
+            filtered_cols = np.count_nonzero(mask == False)
+            logger.info(f"{filtered_cols} columns not considered for ROC AUC calculation!")
+            return {"roc_auc": roc_auc_score(y_true=labels, y_score=y_score, average="macro")}
+        elif task_type == 'multiclass':
+            probs = [softmax(vector) for vector in p.predictions]
+            return {"roc_auc": roc_auc_score(y_true=p.label_ids, y_score=probs, multi_class="ovo", average="macro")}
+        else:
+            logger.info(f"{p.predictions}")
+            logger.info(f"{p.label_ids}")
+            probs = [softmax(vector) for vector in p.predictions]
+            probs_gt_label = np.array(probs)[:, 1]  # Probability of greater label
+            return {"roc_auc": roc_auc_score(y_true=p.label_ids, y_score=probs_gt_label)}
+
+    from scipy.special import expit
+    def predict(sentence):
+        tokens = tokenizer.encode(
+            sentence,
+            return_tensors="pt",
+            padding=True,
+            max_length=512,
+            truncation=True
+        )
+        model.eval()
+        preds = model(tokens, adapter_names=data_args.task_name)[0]
+
+        preds = preds.detach().numpy()
+        if data_args.task_name == "mp" or data_args.task_name == "los":
+            preds = np.argmax(preds)
+            probs=preds
+        else:
+            print("Predictions")
+            print(preds)
+            probs =expit(preds)
+            probs
+
+        return tokenizer.tokenize(sentence), probs
+
+    training_args.do_inference = True
+
+    if training_args.do_inference:
+        logger.info("*** Inference on Test Dataset ***")
+        test_df = pd.read_csv(inference_file)
+        print(model.get_labels())
+        print(model.get_labels_dict())
+        with open(os.path.join(training_args.output_dir, "results_inference_fusion.txt"), "w") as writer:
+            for index, row in test_df.iterrows():
+                print(row['id'])
+                label_map = model.get_labels_dict()
+                tokens, preds = predict(row['text'])
+                print(f"********{row['id']}*********")
+                writer.write(f"{row['id']} =")
+                if task_type=="multilabel":
+                    for i in range(len(preds[0])):
+                        if preds[0][i]>0.5:
+                            print(f"({label_map[i]}) ", end="")
+                            writer.write(f"{label_map[i]},")
+                    writer.write("\n")
+                else:
+                    print(f"**********({label_map[preds]})**********")
+                    writer.write(f"{label_map[preds]}\n")
+
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--config_file', required=True, help='config file')
+    parser.add_argument('--output_dir', required=True, help='output dir for model')
+    parser.add_argument('--adapter_path', required=True, help='output dir for model')
+    parser.add_argument('--inference_file', required=True, help='Path for Inference file')
+    #config_file="/data_dir/MTL/experiments/Adapters/config/config_dia.json"
+    #output_dir="/data_dir/MTL/experiments/models/DIA_Adapter_head"
+    #inference_file="/data_dir/MTL/experiments/evaluation/filtered_ids_inference.csv"
+    doc_classification(config_file,output_dir,inference_file)

@@ -1,0 +1,30 @@
+experiment_name: "outcome_multitask"
+output_dir: "/data_dir/MTL/experiments/models/pro_los"
+log_dir: "/data_dir/MTL/experiments/logs/pro_los"
+data:
+  data_dir: "/data_dir/MTL/tasks/data"
+  train_filename: "MULTITASK_PLUS_adm_train.csv"
+  dev_filename: "MULTITASK_PLUS_adm_val.csv"
+  test_filename: "MULTITASK_PLUS_adm_test.csv"
+  parsing:
+    delimiter: ","
+    quote_char: "\""
+tasks:
+  - name: "pro_plus"
+    task_type: "text_classification"
+    output_type: "per_sequence"
+    multilabel: true
+    metric: "multilabel_classification_metrics_3_digits_only_pro_plus"
+    data:
+      label_list: "/data_dir/MTL/tasks/data/ALL_PROCEDURES_PLUS_CODES.txt"
+      parsing:
+        label_column: "pro_label"
+  - name: "los"
+    task_type: "text_classification"
+    output_type: "per_sequence"
+    multilabel: false
+    metric: "multiclass_classification_metrics_los"
+    data:
+      label_list: [ "0", "1", "2", "3" ]
+      parsing:
+        label_column: "los_label"

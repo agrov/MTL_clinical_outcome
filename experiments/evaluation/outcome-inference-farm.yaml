@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-clin-inference-farm
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: job-clin-inference-farm
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: job-clin-adap-dia-fuse
+          image: registry.datexis.com/s81472/image:clinoutv2
+          imagePullPolicy: "Always"
+          ports:
+            - name: client-port
+              containerPort: 6006
+          resources:
+            limits:
+              nvidia.com/gpu: 1 # requesting 1 GPU
+              memory: 50Gi
+          volumeMounts:
+            - name: claim-clin-ray
+              mountPath: /data_dir/
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+          - name: PYTHONUNBUFFERED
+            value: "0"
+          command:
+            - /bin/sh
+            - "-c"
+            - "python /data_dir/MTL/experiments/evaluation/eval_farm_model.py --model_dir /data_dir/MTL/experiments/models/dia_pro/outcome_multitask_dia_pro_final/exp_336472 --test_file /data_dir/MTL/experiments/evaluation/filtered_ids_inference.csv"
+      nodeSelector:
+        gpu: v100
+      imagePullSecrets:
+        - name:  private-registry-auth
+      volumes:
+        - name: claim-clin-ray
+          persistentVolumeClaim:
+            claimName: claim-clin-ray
+        - name: dshm
+          emptyDir:
+            medium: Memory
+

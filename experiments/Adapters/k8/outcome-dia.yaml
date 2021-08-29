@@ -1,0 +1,47 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: job-clin-adap-dia-test
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: job-clin-adap-dia-test
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: job-clin-adap-dia-test
+          image: registry.datexis.com/s81472/image:clinoutadapv1
+          imagePullPolicy: "Always"
+          ports:
+            - name: client-port
+              containerPort: 6006
+          resources:
+            limits:
+              nvidia.com/gpu: 1 # requesting 1 GPU
+              memory: 50Gi
+          volumeMounts:
+            - name: claim-clin-ray
+              mountPath: /data_dir/
+            - name: dshm
+              mountPath: /dev/shm
+          env:
+          - name: PYTHONUNBUFFERED
+            value: "0"
+          command:
+            - /bin/sh
+            - "-c"
+            - "python /data_dir/MTL/experiments/Adapters/hpo_dia_test_1.py"
+      nodeSelector:
+        gpu: v100
+      imagePullSecrets:
+        - name:  private-registry-auth
+      volumes:
+        - name: claim-clin-ray
+          persistentVolumeClaim:
+            claimName: claim-clin-ray
+        - name: dshm
+          emptyDir:
+            medium: Memory
+
